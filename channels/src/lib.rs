@@ -1,1 +1,3 @@
-pub mod simple_channel;
+mod simple;
+mod unsafe_oneshot;
+mod safe_oneshot;
