@@ -1,5 +1,4 @@
 use std::{
-    borrow::BorrowMut,
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, Ordering},
@@ -12,12 +11,11 @@ pub struct MutexGuard<'a, T> {
 }
 
 impl<T> Drop for MutexGuard<'_, T> {
-
     fn drop(&mut self) {
-        // State back to unlocked
-        self.inner.state.store(0, Ordering::Release);
-        // Wake a single waiting thread, if any
-        wake_one(&self.inner.state);
+        if self.inner.state.swap(0, Ordering::Release) == 2 {
+            // Wake a single waiting thread, if any
+            wake_one(&self.inner.state);
+        }
     }
 }
 
@@ -35,8 +33,11 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 }
 
 pub struct Mutex<T> {
-    // 0 for unlocked
-    // 1 for locked
+    // 0: unlocked
+    // 1: locked with waiting threads
+    // 2: locked with no waiting threads
+    // This optimisation avoids unnecessary syscalls for waking waiting threads
+    // by tracking when a wake is actually required.
     state: AtomicU32,
     value: UnsafeCell<T>,
 }
@@ -52,12 +53,22 @@ impl<T> Mutex<T> {
     }
 
     pub fn lock(&self) -> MutexGuard<T> {
-        // The `wait` can return spuriously, so we use a while loop here to
-        // check the condition again for a guarantee
-        while self.state.swap(1, Ordering::Acquire) == 1 {
-            // If we reach here, the lock has already been locked, so we should
-            // sleep until unlocked by a wake
-            wait(&self.state, 1);
+        // If an err occurs on the swap, the mutex has been locked previously
+        if self
+            .state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // The atomic swap to 2 here is because we know the mutex is locked
+            // already, so we set the state to "multiple threads waiting"
+            //
+            // The return of anything but 0 (unlocked) will cause a wait on this
+            // thread
+            while self.state.swap(2, Ordering::Acquire) != 0 {
+                // If we reach here, the lock has already been locked, so we should
+                // sleep until unlocked by a wake
+                wait(&self.state, 2);
+            }
         }
         MutexGuard { inner: self }
     }
