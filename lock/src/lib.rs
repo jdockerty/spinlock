@@ -59,17 +59,34 @@ impl<T> Mutex<T> {
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            // The atomic swap to 2 here is because we know the mutex is locked
-            // already, so we set the state to "multiple threads waiting"
-            //
-            // The return of anything but 0 (unlocked) will cause a wait on this
-            // thread
-            while self.state.swap(2, Ordering::Acquire) != 0 {
-                // If we reach here, the lock has already been locked, so we should
-                // sleep until unlocked by a wake
-                wait(&self.state, 2);
-            }
+            Self::lock_contended(&self.state);
         }
         MutexGuard { inner: self }
+    }
+
+    fn lock_contended(state: &AtomicU32) {
+        let mut spin_count = 0;
+        // Basic spinlock behaviour to avoid sleeping the thread on very short
+        // lock hold durations. This is much more efficient than the subsequent
+        // syscalls for the wait/wake case.
+        // Note that we only do this when the lock has no waiters.
+        while state.load(Ordering::Relaxed) == 1 && spin_count < 100 {
+            spin_count += 1;
+            std::hint::spin_loop();
+        }
+
+        // Lock the mutex with no waiters state if it is unlocked and return
+        if state
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+
+        // Wait the thread when not unlocked after failing to unlock earlier
+        // with our hybrid spinlock impl
+        while state.swap(2, Ordering::Acquire) != 0 {
+            wait(state, 2);
+        }
     }
 }
